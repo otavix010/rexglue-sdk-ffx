@@ -1,0 +1,226 @@
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 19874a5..9b26cfa 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -3194,6 +3194,8 @@ void D3D12CommandProcessor::CheckSubmissionFence(uint64_t await_submission) {
+   texture_cache_->CompletedSubmissionUpdated(submission_completed_);
+ }
+ 
++void DumpPortGpuTrace();  // deferred_command_list.cpp
++
+ void D3D12CommandProcessor::LogDeviceRemovalDiagnostics(ID3D12Device* device, HRESULT reason) {
+   const char* reason_str = "Unknown";
+   switch (reason) {
+@@ -3426,7 +3428,13 @@ bool D3D12CommandProcessor::EndSubmission(bool is_swap) {
+     command_allocator->Reset();
+     command_list_->Reset(command_allocator, nullptr);
+     deferred_command_list_.Execute(command_list_, command_list_1_);
+-    command_list_->Close();
++    HRESULT close_result = command_list_->Close();
++    if (FAILED(close_result)) {
++      // a command recorded in this submission was invalid: executing it removes the device (INVALID_CALL)
++      REXGPU_ERROR("D3D12 command list Close failed: 0x{:08X} (submission {})",
++                   static_cast<unsigned>(close_result), submission_current_);
++      DumpPortGpuTrace();
++    }
+     ID3D12CommandList* execute_command_lists[] = {command_list_};
+     direct_queue->ExecuteCommandLists(1, execute_command_lists);
+     command_allocator_writable_first_->last_usage_submission = submission_current_;
+diff --git a/src/graphics/d3d12/deferred_command_list.cpp b/src/graphics/d3d12/deferred_command_list.cpp
+index e6d6277..103c9df 100644
+--- a/src/graphics/d3d12/deferred_command_list.cpp
++++ b/src/graphics/d3d12/deferred_command_list.cpp
+@@ -14,6 +14,13 @@
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/deferred_command_list.h>
+ #include <rex/graphics/flags.h>
++#include <rex/logging.h>
++
++#include <cstdlib>
++#include <deque>
++#include <string>
++
++#include <fmt/format.h>
+ #include <rex/math.h>
+ 
+ namespace rex::graphics::d3d12 {
+@@ -28,6 +35,36 @@ void DeferredCommandList::Reset() {
+   command_stream_.clear();
+ }
+ 
++// port diagnostics (PORT_GPU_TRACE set): a line for each command of the submission being executed, the last ones
++// written to the log when the command list's Close fails (DumpPortGpuTrace, from the command processor)
++namespace {
++bool PortGpuTraceOn() {
++  static const bool on = std::getenv("PORT_GPU_TRACE") != nullptr;
++  return on;
++}
++std::deque<std::string>& PortGpuTrace() {
++  static std::deque<std::string> trace;
++  return trace;
++}
++std::string DescribeLocation(const D3D12_TEXTURE_COPY_LOCATION& l) {
++  D3D12_RESOURCE_DESC d = l.pResource->GetDesc();
++  std::string res = fmt::format("res {}x{}x{} fmt {} mips {} dim {}", d.Width, d.Height, d.DepthOrArraySize,
++                                int(d.Format), d.MipLevels, int(d.Dimension));
++  if (l.Type == D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT) {
++    const auto& f = l.PlacedFootprint;
++    return fmt::format("footprint off {} {}x{}x{} pitch {} fmt {} in {}", f.Offset, f.Footprint.Width,
++                       f.Footprint.Height, f.Footprint.Depth, f.Footprint.RowPitch, int(f.Footprint.Format),
++                       res);
++  }
++  return fmt::format("subresource {} of {}", l.SubresourceIndex, res);
++}
++}  // namespace
++
++void DumpPortGpuTrace() {
++  for (const std::string& line : PortGpuTrace()) REXGPU_ERROR("  trace: {}", line);
++  REXGPU_ERROR("  trace: {} commands in the submission", PortGpuTrace().size());
++}
++
+ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+                                   ID3D12GraphicsCommandList1* command_list_1) {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+@@ -36,10 +73,70 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+   const uintmax_t* stream = command_stream_.data();
+   size_t stream_remaining = command_stream_.size();
+   ID3D12PipelineState* current_pipeline_state = nullptr;
++  const bool trace = PortGpuTraceOn();
++  if (trace) PortGpuTrace().clear();
+   while (stream_remaining != 0) {
+     const CommandHeader& header = *reinterpret_cast<const CommandHeader*>(stream);
+     stream += kCommandHeaderSizeElements;
+     stream_remaining -= kCommandHeaderSizeElements;
++    if (trace) {
++      std::string line = fmt::format("cmd {}", int(header.command));
++      switch (header.command) {
++        case Command::kCopyTexture: {
++          auto& a = *reinterpret_cast<const CopyTextureArguments*>(stream);
++          line += " CopyTexture dst " + DescribeLocation(a.dst) + " src " + DescribeLocation(a.src);
++        } break;
++        case Command::kD3DCopyTextureRegion: {
++          auto& a = *reinterpret_cast<const D3DCopyTextureRegionArguments*>(stream);
++          line += fmt::format(" CopyTextureRegion at {},{},{} dst ", a.dst_x, a.dst_y, a.dst_z) +
++                  DescribeLocation(a.dst) + " src " + DescribeLocation(a.src);
++          if (a.has_src_box)
++            line += fmt::format(" box {},{},{}-{},{},{}", a.src_box.left, a.src_box.top, a.src_box.front,
++                                a.src_box.right, a.src_box.bottom, a.src_box.back);
++        } break;
++        case Command::kRSSetViewport: {
++          auto& v = *reinterpret_cast<const D3D12_VIEWPORT*>(stream);
++          line += fmt::format(" Viewport {} {} {}x{} depth {}-{}", v.TopLeftX, v.TopLeftY, v.Width, v.Height,
++                              v.MinDepth, v.MaxDepth);
++        } break;
++        case Command::kRSSetScissorRect: {
++          auto& r = *reinterpret_cast<const D3D12_RECT*>(stream);
++          line += fmt::format(" Scissor {},{}-{},{}", r.left, r.top, r.right, r.bottom);
++        } break;
++        case Command::kD3DCopyBufferRegion: {
++          auto& a = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(stream);
++          line += fmt::format(" CopyBufferRegion {} bytes", a.num_bytes);
++        } break;
++        case Command::kD3DDispatch: {
++          auto& a = *reinterpret_cast<const D3DDispatchArguments*>(stream);
++          line += fmt::format(" Dispatch {}x{}x{}", a.thread_group_count_x, a.thread_group_count_y,
++                              a.thread_group_count_z);
++        } break;
++        case Command::kD3DClearUnorderedAccessViewUint: {
++          auto& a = *reinterpret_cast<const ClearUnorderedAccessViewHeader*>(stream);
++          line += fmt::format(" ClearUAV rects {}", a.num_rects);
++        } break;
++        case Command::kD3DBeginQuery:
++        case Command::kD3DEndQuery: {
++          auto& a = *reinterpret_cast<const D3DQueryArguments*>(stream);
++          line += fmt::format(" Query type {} index {}", int(a.type), a.index);
++        } break;
++        case Command::kD3DResolveQueryData: {
++          auto& a = *reinterpret_cast<const D3DResolveQueryDataArguments*>(stream);
++          line += fmt::format(" ResolveQueryData type {} from {} count {} to offset {} of {}", int(a.type),
++                              a.start_index, a.num_queries, a.aligned_destination_buffer_offset,
++                              a.destination_buffer->GetDesc().Width);
++        } break;
++        case Command::kD3DSetSamplePositions: {
++          auto& a = *reinterpret_cast<const D3DSetSamplePositionsArguments*>(stream);
++          line += fmt::format(" SamplePositions {} per pixel, {} pixels", a.num_samples_per_pixel, a.num_pixels);
++        } break;
++        default:
++          break;
++      }
++      PortGpuTrace().push_back(std::move(line));
++      if (PortGpuTrace().size() > 30000) PortGpuTrace().pop_front();
++    }
+     switch (header.command) {
+       case Command::kD3DClearDepthStencilView: {
+         auto& args = *reinterpret_cast<const ClearDepthStencilViewHeader*>(stream);
+@@ -62,6 +159,14 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+       } break;
+       case Command::kD3DCopyBufferRegion: {
+         auto& args = *reinterpret_cast<const D3DCopyBufferRegionArguments*>(stream);
++        // port diagnostics: a copy out of either buffer makes the list's Close fail
++        uint64_t dst_size = trace ? args.dst_buffer->GetDesc().Width : 0;
++        uint64_t src_size = trace ? args.src_buffer->GetDesc().Width : 0;
++        if (trace && (args.dst_offset + args.num_bytes > dst_size || args.src_offset + args.num_bytes > src_size)) {
++          REXGPU_ERROR("D3D12 CopyBufferRegion out of range: dst {}+{} of {}, src {}+{} of {}",
++                       args.dst_offset, args.num_bytes, dst_size, args.src_offset, args.num_bytes,
++                       src_size);
++        }
+         command_list->CopyBufferRegion(args.dst_buffer, args.dst_offset, args.src_buffer,
+                                        args.src_offset, args.num_bytes);
+       } break;
+@@ -81,6 +186,14 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+       case Command::kD3DDispatch: {
+         if (current_pipeline_state != nullptr) {
+           auto& args = *reinterpret_cast<const D3DDispatchArguments*>(stream);
++          // port diagnostics: more than 65535 groups along an axis makes the list's Close fail
++          if (trace && (args.thread_group_count_x > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION ||
++              args.thread_group_count_y > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION ||
++              args.thread_group_count_z > D3D12_CS_DISPATCH_MAX_THREAD_GROUPS_PER_DIMENSION)) {
++            REXGPU_ERROR("D3D12 Dispatch over the limit: {} x {} x {} groups",
++                         args.thread_group_count_x, args.thread_group_count_y,
++                         args.thread_group_count_z);
++          }
+           command_list->Dispatch(args.thread_group_count_x, args.thread_group_count_y,
+                                  args.thread_group_count_z);
+         }
+@@ -146,6 +259,23 @@ void DeferredCommandList::Execute(ID3D12GraphicsCommandList* command_list,
+       } break;
+       case Command::kD3DResourceBarrier: {
+         static_assert(alignof(D3D12_RESOURCE_BARRIER) <= alignof(uintmax_t));
++        if (trace) {
++          // port diagnostics: a transition to the state it is in, or of no resource, makes the list's Close fail
++          UINT count = *reinterpret_cast<const UINT*>(stream);
++          auto* barriers = reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(
++              reinterpret_cast<const uint8_t*>(stream) +
++              rex::align(sizeof(UINT), alignof(D3D12_RESOURCE_BARRIER)));
++          for (UINT i = 0; i < count; ++i) {
++            const D3D12_RESOURCE_BARRIER& b = barriers[i];
++            if (b.Type == D3D12_RESOURCE_BARRIER_TYPE_TRANSITION &&
++                (!b.Transition.pResource || b.Transition.StateBefore == b.Transition.StateAfter)) {
++              REXGPU_ERROR("D3D12 bad transition barrier: resource {} state 0x{:X} -> 0x{:X}",
++                           static_cast<const void*>(b.Transition.pResource),
++                           static_cast<unsigned>(b.Transition.StateBefore),
++                           static_cast<unsigned>(b.Transition.StateAfter));
++            }
++          }
++        }
+         command_list->ResourceBarrier(
+             *reinterpret_cast<const UINT*>(stream),
+             reinterpret_cast<const D3D12_RESOURCE_BARRIER*>(
+diff --git a/src/graphics/d3d12/texture_cache.cpp b/src/graphics/d3d12/texture_cache.cpp
+index 2be0e8e..cf4fa21 100644
+--- a/src/graphics/d3d12/texture_cache.cpp
++++ b/src/graphics/d3d12/texture_cache.cpp
+@@ -1995,6 +1995,13 @@ ID3D12Resource* D3D12TextureCache::D3D12Texture::GetOrCreate3DAs2DResource(
+   desc.Alignment = 0;
+   desc.Width = key().GetWidth();
+   desc.Height = key().GetHeight();
++  // The wrapper keeps the texture's key, scaled_resolve too, so its data is loaded at the scaled size: the resource
++  // has to be that size as well, as CreateTexture makes it (an unscaled one made the copy into it run out of the
++  // resource, failing the command list's Close and removing the device at any resolution scale above 1).
++  if (key().scaled_resolve) {
++    desc.Width *= d3d12_cache.draw_resolution_scale_x();
++    desc.Height *= d3d12_cache.draw_resolution_scale_y();
++  }
+   desc.DepthOrArraySize = 1;
+   desc.MipLevels = 1;
+   desc.Format = d3d12_cache.GetDXGIResourceFormat(key());
